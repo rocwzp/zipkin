@@ -15,18 +15,23 @@
  */
 package com.twitter.zipkin.web
 
-import com.twitter.app.App
-import com.twitter.conversions.time._
-import com.twitter.finagle.http.HttpMuxer
-import com.twitter.finagle.stats.{DefaultStatsReceiver, StatsReceiver}
-import com.twitter.finagle.{Http, Service, Thrift}
-import com.twitter.server.TwitterServer
-import com.twitter.util.{Await, Future}
-import com.twitter.zipkin.common.json.ZipkinJson
-import com.twitter.zipkin.common.mustache.ZipkinMustache
-import com.twitter.zipkin.thriftscala.ZipkinQuery
 import java.net.InetSocketAddress
-import org.jboss.netty.handler.codec.http.{HttpRequest, HttpResponse}
+
+import ch.qos.logback.classic.{Level, Logger}
+import com.twitter.app.App
+import com.twitter.finagle._
+import com.twitter.finagle.http.{HttpMuxer, Request, Response}
+import com.twitter.finagle.server.StackServer
+import com.twitter.finagle.stats.{DefaultStatsReceiver, StatsReceiver}
+import com.twitter.finagle.tracing.{DefaultTracer, NullTracer}
+import com.twitter.finagle.zipkin.thrift.{HttpZipkinTracer, RawZipkinTracer}
+import com.twitter.finatra.httpclient.HttpClient
+import com.twitter.finatra.json.FinatraObjectMapper
+import com.twitter.server.TwitterServer
+import com.twitter.util.Await
+import com.twitter.zipkin.json.ZipkinJson
+import com.twitter.zipkin.web.mustache.ZipkinMustache
+import org.slf4j.LoggerFactory
 
 trait ZipkinWebFactory { self: App =>
   private[this] val resourceDirs = Set(
@@ -52,20 +57,37 @@ trait ZipkinWebFactory { self: App =>
   val webRootUrl = flag("zipkin.web.rootUrl", "http://localhost:8080/", "Url where the service is located")
   val webCacheResources = flag("zipkin.web.cacheResources", false, "cache static resources and mustache templates")
   val webResourcesRoot = flag("zipkin.web.resourcesRoot", "zipkin-web/src/main/resources", "on-disk location of resources")
-  val webPinTtl = flag("zipkin.web.pinTtl", 30.days, "Length of time pinned traces should exist")
 
   val queryDest = flag("zipkin.web.query.dest", "127.0.0.1:9411", "Location of the query server")
-  def newQueryClient(): ZipkinQuery.FutureIface =
-    Thrift.newIface[ZipkinQuery.FutureIface]("ZipkinQuery=" + queryDest())
+  val queryLimit = flag("zipkin.web.query.limit", 10, "Default query limit for trace results")
+  val environment = flag("zipkin.web.environmentName", "", "The name of the environment Zipkin is running in")
 
-  def newJsonGenerator = new ZipkinJson
+  val logLevel = sys.env.get("WEB_LOG_LEVEL").getOrElse("INFO")
+  LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME)
+    .asInstanceOf[Logger].setLevel(Level.toLevel(logLevel))
+
+ /**
+  * Initialize a json-aware Finatra client, targeting the query host. Lazy to ensure
+  * we get the host after the [[queryDest]] flag has been parsed.
+  */
+  lazy val queryClient = new HttpClient(
+    httpService = Http.client.configured(param.Label("zipkin-query"))
+                             .newClient(queryDest()).toService,
+    defaultHeaders = Map(
+      "Host" -> queryDest(),
+      "Accept-Encoding" -> "gzip"
+    ),
+    mapper = new FinatraObjectMapper(ZipkinJson)
+  )
+
   def newMustacheGenerator = new ZipkinMustache(webResourcesRoot(), webCacheResources())
-  def newHandlers = new Handlers(newJsonGenerator, newMustacheGenerator)
+  def newQueryExtractor = new QueryExtractor(queryLimit())
+  def newHandlers = new Handlers(newMustacheGenerator, newQueryExtractor)
 
   def newWebServer(
-    queryClient: ZipkinQuery[Future] = newQueryClient(),
+    queryClient: HttpClient = queryClient,
     stats: StatsReceiver = DefaultStatsReceiver.scope("zipkin-web")
-  ): Service[HttpRequest, HttpResponse] = {
+  ): Service[Request, Response] = {
     val handlers = newHandlers
     import handlers._
 
@@ -73,26 +95,18 @@ trait ZipkinWebFactory { self: App =>
     Seq(
       ("/app/", handlePublic(resourceDirs, typesMap, publicRoot)),
       ("/public/", handlePublic(resourceDirs, typesMap, publicRoot)),
-      ("/", addLayout andThen handleIndex(queryClient)),
-      ("/traces/:id", addLayout andThen handleTraces(queryClient)),
-      ("/api/query", handleQuery(queryClient)),
-      ("/api/services", handleServices(queryClient)),
-      ("/api/spans", requireServiceName andThen handleSpans(queryClient)),
-      ("/api/top_annotations", requireServiceName andThen handleTopAnnotations(queryClient)),
-      ("/api/top_kv_annotations", requireServiceName andThen handleTopKVAnnotations(queryClient)),
-      ("/api/dependencies", handleDependencies(queryClient)),
-      ("/api/dependencies/?:startTime/?:endTime", handleDependencies(queryClient)),
-      ("/api/get/:id", handleGetTrace(queryClient)),
-      ("/api/trace/:id", handleGetTrace(queryClient)),
-      ("/api/is_pinned/:id", handleIsPinned(queryClient)),
-      ("/api/pin/:id/:state", handleTogglePin(queryClient, webPinTtl()))
+      ("/", addLayout("Index", environment()) andThen handleIndex(queryClient)),
+      ("/traces/:id", addLayout("Traces", environment()) andThen handleTraces(queryClient)),
+      ("/dependency", addLayout("Dependency", environment()) andThen handleDependency()),
+      ("/api/spans", handleRoute(queryClient, "/api/v1/spans")),
+      ("/api/services", handleRoute(queryClient, "/api/v1/services")),
+      ("/api/dependencies", handleRoute(queryClient, "/api/v1/dependencies"))
     ).foldLeft(new HttpMuxer) { case (m , (p, handler)) =>
       val path = p.split("/").toList
       val handlePath = path.takeWhile { t => !(t.startsWith(":") || t.startsWith("?:")) }
       val suffix = if (p.endsWith("/") || p.contains(":")) "/" else ""
 
       m.withHandler(handlePath.mkString("/") + suffix,
-        nettyToFinagle andThen
         collectStats(handlePath.foldLeft(stats) { case (s, p) => s.scope(p) }) andThen
         renderPage andThen
         catchExceptions andThen
@@ -103,9 +117,29 @@ trait ZipkinWebFactory { self: App =>
 }
 
 object Main extends TwitterServer with ZipkinWebFactory {
-  def main() {
-    val server = Http.serve(webServerPort(), newWebServer(stats = statsReceiver.scope("zipkin-web")))
+
+  /** If the span transport is set, trace accordingly, or disable tracing. */
+  premain {
+    DefaultTracer.self = sys.env.get("TRANSPORT_TYPE") match {
+      case Some("scribe") => RawZipkinTracer(sys.env.get("SCRIBE_HOST").getOrElse("localhost"), sys.env.get("SCRIBE_PORT").getOrElse("1463").toInt)
+      case Some("http") => new HttpZipkinTracer(queryDest(), DefaultStatsReceiver.get)
+      case _ => NullTracer
+    }
+  }
+
+  def main() = {
+    BootstrapTrace.record("main")
+
+    // Httpx.server will trace all paths. We don't care about static assets, so need to customize
+    val server = Http.Server(StackServer.newStack
+      .replace(FilteredHttpEntrypointTraceInitializer.role, FilteredHttpEntrypointTraceInitializer))
+      .configured(param.Label("zipkin-web"))
+      .serve(webServerPort(), newWebServer(stats = statsReceiver.scope("zipkin-web")))
     onExit { server.close() }
+
+    BootstrapTrace.complete()
+
+    // Note: this is blocking, so nothing after this will be called.
     Await.ready(server)
   }
 }

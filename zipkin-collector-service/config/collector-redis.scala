@@ -13,16 +13,36 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-import com.twitter.zipkin.builder.Scribe
+
+import com.twitter.finagle.builder.ClientBuilder
+import com.twitter.finagle.redis.{Client, Redis}
+import com.twitter.zipkin.collector.builder.{Adjustable, CollectorServiceBuilder, ZipkinServerBuilder}
+import com.twitter.zipkin.receiver.kafka.KafkaSpanReceiverFactory
 import com.twitter.zipkin.redis
-import com.twitter.zipkin.collector.builder.CollectorServiceBuilder
 import com.twitter.zipkin.storage.Store
 
+val serverPort = sys.env.get("COLLECTOR_PORT").getOrElse("9410").toInt
+val adminPort = sys.env.get("COLLECTOR_ADMIN_PORT").getOrElse("9900").toInt
+val logLevel = sys.env.get("COLLECTOR_LOG_LEVEL").getOrElse("INFO")
+val sampleRate = sys.env.get("COLLECTOR_SAMPLE_RATE").getOrElse("1.0").toDouble
 
-val redisBuilder = Store.Builder(
-    redis.StorageBuilder("0.0.0.0", 6379),
-    redis.IndexBuilder("0.0.0.0", 6379)
+val host = sys.env.get("REDIS_HOST").getOrElse("0.0.0.0")
+val port = sys.env.get("REDIS_PORT").map(_.toInt).getOrElse(6379)
+
+val client = Client(ClientBuilder().hosts(host + ":" + port)
+                                   .hostConnectionLimit(4)
+                                   .hostConnectionCoresize(4)
+                                   .codec(Redis())
+                                   .build())
+
+val storeBuilder = Store.Builder(redis.SpanStoreBuilder(client, authPassword = sys.env.get("REDIS_PASSWORD")))
+val kafkaReceiver = sys.env.get("KAFKA_ZOOKEEPER").map(
+  KafkaSpanReceiverFactory.factory(_, sys.env.get("KAFKA_TOPIC").getOrElse("zipkin"))
 )
 
-CollectorServiceBuilder(Scribe.Interface(categories = Set("zipkin")))
-  .writeTo(redisBuilder)
+CollectorServiceBuilder(
+  storeBuilder,
+  kafkaReceiver,
+  serverBuilder = ZipkinServerBuilder(serverPort, adminPort),
+  logLevel = logLevel
+).sampleRate(Adjustable.local(sampleRate))

@@ -16,61 +16,105 @@
  */
 package com.twitter.zipkin.common
 
-import com.twitter.util.Time
-import com.twitter.algebird.{Monoid, Semigroup, Moments}
+import scala.util.hashing.MurmurHash3
 
 /**
- * Abstraction of a service
- */
-case class Service(name: String)
-
-/**
- * A representation of the fact that one service calls another.  These should be unique across
+ * A representation of the fact that one service calls another. These should be unique across
  * the set of (parent, child)
- * @param parent the calling service
- * @param child the service being called
- * @param durationMoments moments describing the distribution of durations (in microseconds) for this link
+ *
+ * @param _parent the calling [[com.twitter.zipkin.common.Endpoint.serviceName]]
+ * @param _child the callee's [[com.twitter.zipkin.common.Endpoint.serviceName]]
+ * @param callCount calls made during the duration (in milliseconds) of this link
  */
-case class DependencyLink(parent: Service, child: Service, durationMoments: Moments)
+// This is not a case-class as we need to enforce serviceName and spanName as lowercase
+class DependencyLink(_parent: String, _child: String, val callCount: Long) {
+  /** the calling [[com.twitter.zipkin.common.Endpoint.serviceName]] */
+  val parent: String = _parent.toLowerCase
+
+  /** the callee's [[com.twitter.zipkin.common.Endpoint.serviceName]] */
+  val child: String = _child.toLowerCase
+
+  override def toString = "%s->%s(%d)".format(parent, child, callCount)
+
+  override def hashCode = MurmurHash3.seqHash(List(parent, child, callCount))
+
+  override def equals(other: Any) = other match {
+    case x: DependencyLink => x.parent == parent && x.child == child && x.callCount == callCount
+    case _ => false
+  }
+
+  def copy(
+    parent: String = this.parent,
+    child: String = this.child,
+    callCount: Long = this.callCount
+  ) = DependencyLink(parent, child, callCount)
+}
 
 object DependencyLink {
-  // this gives us free + operator along with other algebird aggregation methods
-  implicit val sg: Semigroup[DependencyLink] = new Semigroup[DependencyLink] {
-    def plus(l: DependencyLink, r: DependencyLink) = {
-      assert(l.child == r.child && l.parent == r.parent)
-      DependencyLink(l.parent, l.child, Monoid.plus(l.durationMoments, r.durationMoments))
-    }
-  }
+  def apply(parent: String, child: String, callCount: Long) =
+    new DependencyLink(parent, child, callCount)
 }
 
 /**
  * This represents all dependencies across all services over a given time period.
- * @param startTime the startTime time for this period
- * @param endTime how long the period lasted
+ *
+ * @param startTs milliseconds from epoch
+ * @param endTs milliseconds from epoch
  * @param links link information for every dependent service
  */
-case class Dependencies(
-  startTime: Time,
-  endTime: Time,
-  links: Seq[DependencyLink]
-)
-
-object Dependencies {
+case class Dependencies(startTs: Long, endTs: Long, links: Seq[DependencyLink]) {
   // used for summing/merging database rows
-  implicit val monoid: Monoid[Dependencies] = new Monoid[Dependencies] {
-    def plus(l: Dependencies, r: Dependencies) = {
-      // new start/end should be the inclusive time span of both items
-      val newStart = r.startTime min l.startTime
-      val newEnd = r.endTime max l.endTime
-
-      // links are merged by mapping to parent/child and summing corresponding links
-      val lLinkMap = l.links.map { link => (link.parent, link.child) -> link }.toMap
-      val rLinkMap = r.links.map { link => (link.parent, link.child) -> link }.toMap
-      val newLinks = Monoid.plus(rLinkMap, lLinkMap).values.toSeq
-
-      Dependencies(newStart, newEnd, newLinks)
+  def +(that: Dependencies): Dependencies = {
+    // don't sum against Dependencies.zero
+    if (that == Dependencies.zero) {
+      return this
+    } else if (this == Dependencies.zero) {
+      return that
     }
 
-    val zero = Dependencies(Time.Top, Time.Bottom, Seq.empty[DependencyLink])
+    // new start/end should be the inclusive time span of both items
+    val newStart = startTs min that.startTs
+    val newEnd = endTs max that.endTs
+
+    // links are merged by mapping to parent/child and summing corresponding links
+    val lLinkMap = that.links.map { link => (link.parent, link.child) -> link }.toMap
+    val rLinkMap = links.map { link => (link.parent, link.child) -> link }.toMap
+
+    val merged = lLinkMap.toSeq ++ rLinkMap.toSeq
+    val newLinks = merged.groupBy(_._1) // group by parent/child
+      .mapValues(_.map(_._2).toList) // concatenate values
+      .map({
+      case ((parent, child), links) => DependencyLink(parent, child, links.map(_.callCount).sum)
+    }).toSeq
+    Dependencies(newStart, newEnd, newLinks)
+  }
+}
+
+object Dependencies {
+  val zero = Dependencies(0, 0, Seq.empty[DependencyLink])
+
+  def toLinks(spans: Seq[Span]): Seq[DependencyLink] = {
+    val flattenedSpans: Map[(Long, Long), Span] = spans
+      .filter(_.serviceName.isDefined)
+      .groupBy(s => (s.id, s.traceId))
+      .mapValues(spans => spans.reduce((s1, s2) => s1.merge(s2)))
+
+    val childCountByParent: Map[(Long, Long), Map[String, Long]] = flattenedSpans
+      .filter { case (key, span) => span.parentId.isDefined }
+      .mapValues(span => ((span.parentId.get, span.traceId), span))
+      .groupBy(_._2._1) // group by parentId, traceId
+      .mapValues(_.values.map(_._2.serviceName.get).toList) // convert values to serviceNames
+      .mapValues(serviceNames => serviceNames.groupBy(identity).mapValues(_.size)) // count serviceNames
+
+    val parentToChildCount: Map[(String, String), Long] = flattenedSpans // join on key
+      .map { case (key, span) => span.serviceName.get -> childCountByParent.getOrElse(key, Map.empty) }
+      .flatMap { case (parent, childServiceNameCount) => // Convert from Map of Maps to something we can sum
+        childServiceNameCount.map { case (child, count) => ((parent, child), count) }
+      }
+      .groupBy(_._1).mapValues(_.map(_._2).seq.sum) // collect and sum entries with same parent, child
+
+    parentToChildCount.map {
+      case (parentChild, count) => DependencyLink(parentChild._1, parentChild._2, count)
+    }.toSeq
   }
 }

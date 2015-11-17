@@ -1,0 +1,11 @@
+test.maxParallelForks = 1
+
+dependencies {
+    compile project(':zipkin-scrooge')
+    compile project(':zipkin-cassandra-core')
+
+    // for SpanStoreSpec
+    testCompile project(':zipkin-common').sourceSets.test.output
+    testCompile "org.apache.cassandra:cassandra-all:${commonVersions.cassandra}"
+}
+

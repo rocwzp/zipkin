@@ -16,25 +16,53 @@
  */
 package com.twitter.zipkin.sampler
 
+import com.twitter.finagle.http.HttpMuxer
+import java.net.InetSocketAddress
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
+
 import com.google.common.collect.EvictingQueue
 import com.twitter.app.App
 import com.twitter.conversions.time._
-import com.twitter.finagle.Service
+import com.twitter.finagle.{Filter, Service}
 import com.twitter.finagle.stats.{DefaultStatsReceiver, StatsReceiver}
 import com.twitter.finagle.util.DefaultTimer
 import com.twitter.logging.Logger
 import com.twitter.util._
 import com.twitter.zipkin.common.Span
-import com.twitter.zipkin.storage.SpanStore
-import com.twitter.zipkin.zookeeper._
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference, AtomicInteger}
+
 import scala.reflect.ClassTag
 
-trait AdaptiveSampler { self: App with ZooKeeperClientFactory =>
+/**
+ * The adaptive sampler optimizes sampling towards a global rate. This state
+ * is maintained in ZooKeeper.
+ *
+ * {{{
+ * object MyCollectorServer extends TwitterServer
+ *   with ..
+ *   with AdaptiveSampler {
+ *
+ *   // Sampling will adjust dynamically towards a target rate.
+ *   override def spanStoreFilter = newAdaptiveSamplerFilter()
+ *
+ *   def main() {
+ *
+ *     // Adds endpoints to adjust the sample rate via http
+ *     configureAdaptiveSamplerHttpApi()
+ *
+ * --snip--
+ * }}}
+ *
+ */
+trait AdaptiveSampler { self: App =>
   val asBasePath = flag(
     "zipkin.sampler.adaptive.basePath",
     "/com/twitter/zipkin/sampler/adaptive",
     "Base path in ZooKeeper for the sampler to use")
+
+  val asApiPath = flag(
+    "zipkin.sampler.adaptive.apiPath",
+    "/admin/sampler/adaptive",
+    "Http path under for /targetStoreRate and /sampleRate, each accepting the newRate parameter")
 
   val asUpdateFreq = flag(
     "zipkin.sampler.adaptive.updateFreq",
@@ -56,6 +84,24 @@ trait AdaptiveSampler { self: App with ZooKeeperClientFactory =>
     5.minutes,
     "Amount of time to see outliers before updating sample rate")
 
+  val zkServerLocations = flag(
+    "zipkin.zookeeper.location",
+    Seq(new InetSocketAddress(2181)),
+    "Location of the ZooKeeper server")
+
+  val zkServerCredentials = flag(
+    "zipkin.zookeeper.credentials",
+    "[none]",
+    "Optional credentials of the form 'username:password'")
+
+  lazy val zkClient = {
+    val creds = zkServerCredentials.get map { creds =>
+      val Array(u, p) = creds.split(':')
+      (u, p)
+    }
+    new ZKClient(zkServerLocations(), creds)
+  }
+
   def adaptiveSampleRateCalculator(
     targetStoreRate: Var[Int],
     curReqRate: Var[Int],
@@ -70,6 +116,31 @@ trait AdaptiveSampler { self: App with ZooKeeperClientFactory =>
     new CalculateSampleRate(targetStoreRate, sampleRate, stats = stats.scope("sampleRateCalculator"), log = log)
   }
 
+  /**
+   * Adds an http api under the path [[asApiPath]] with the following endpoints:
+   *
+   * - /targetStoreRate
+   *   - Adapt rate such that the collector will write this many spans to storage.
+   * - /sampleRate
+   *   - Manually set the sampling rate. If this is set to 0 it will not adjust towards targetStoreRate.
+   *
+   * Both endpoints respond to the query param `newRate`.
+   *
+   * For example, once invoked, the following endpoints will respond with corresponding rates:
+   *
+   * - http://collectorhost/admin/sampler/adaptive/targetStoreRate
+   * - http://collectorhost/admin/sampler/adaptive/sampleRate
+   */
+  def configureAdaptiveSamplerHttpApi(): Unit = {
+    HttpMuxer.addHandler(
+      asApiPath() + "/targetStoreRate",
+      new ZkPathUpdater[Int](zkClient, asBasePath() + "/targetStoreRate", _.toInt, _ >= 0))
+
+    HttpMuxer.addHandler(
+      asApiPath() + "/sampleRate",
+      new ZkPathUpdater[Double](zkClient, asBasePath() + "/sampleRate", _.toDouble, _ >= 0.0))
+  }
+
   def newAdaptiveSamplerFilter(
     electionPath: String = asBasePath() + "/election",
     reporterPath: String = asBasePath() + "/requestRates",
@@ -77,16 +148,23 @@ trait AdaptiveSampler { self: App with ZooKeeperClientFactory =>
     targetStoreRatePath: String = asBasePath() + "/targetStoreRate",
     stats: StatsReceiver = DefaultStatsReceiver.scope("adaptiveSampler"),
     log: Logger = Logger.get("adaptiveSampler")
-  ): SpanStore.Filter = {
-    def translateNode[T](name: String, default: T, f: String => T): Array[Byte] => T = { bytes => try {
-      val str = new String(bytes)
-      log.debug("node translator [%s] got \"%s\"".format(name, str))
-      f(str)
-    } catch {
-      case e: Exception =>
-        log.error(e, "node translator [%s] error".format(name))
+  ): Filter[Seq[Span], Unit, Seq[Span], Unit] = {
+    def translateNode[T](name: String, default: T, f: String => T): Array[Byte] => T = { bytes =>
+      if (bytes.length == 0) {
+        log.debug("node translator [%s] defaulted to \"%s\"".format(name, default))
         default
-    } }
+      } else {
+        val str = new String(bytes)
+        log.debug("node translator [%s] got \"%s\"".format(name, str))
+        try {
+          f(str)
+        } catch {
+          case e: Exception =>
+            log.error(e, "node translator [%s] error".format(name))
+            default
+        }
+      }
+    }
 
     val targetStoreRateWatch = zkClient.watchData(targetStoreRatePath)
     val targetStoreRate = targetStoreRateWatch.data.map(translateNode("targetStoreRate", 0, _.toInt))
@@ -94,8 +172,8 @@ trait AdaptiveSampler { self: App with ZooKeeperClientFactory =>
     val curReqRate = Var[Int](0)
     val reportingGroup = zkClient.joinGroup(reporterPath, curReqRate.map(_.toString.getBytes))
 
-    val smplRateWatch = zkClient.watchData(sampleRatePath)
-    val smplRate = smplRateWatch.data.map(translateNode("smplRate", 0.0, _.toDouble))
+    val sampleRateWatch = zkClient.watchData(sampleRatePath)
+    val sampleRate = sampleRateWatch.data.map(translateNode("sampleRate", 0.0, _.toDouble))
 
     val buffer = new AtomicRingBuffer[Int](asWindowSize().inSeconds / asUpdateFreq().inSeconds)
 
@@ -104,7 +182,7 @@ trait AdaptiveSampler { self: App with ZooKeeperClientFactory =>
 
     val calculator =
       { v: Int => Some(buffer.pushAndSnap(v)) } andThen
-      adaptiveSampleRateCalculator(targetStoreRate, curReqRate, smplRate, stats, log) andThen
+      adaptiveSampleRateCalculator(targetStoreRate, curReqRate, sampleRate, stats, log) andThen
       isLeader andThen
       cooldown
 
@@ -121,14 +199,14 @@ trait AdaptiveSampler { self: App with ZooKeeperClientFactory =>
       val closer = Closable.all(
         targetStoreRateWatch,
         reportingGroup,
-        smplRateWatch,
+        sampleRateWatch,
         isLeader,
         globalSampleRateUpdater)
 
       Await.ready(closer.close())
     }
 
-    new SpanSamplerFilter(new Sampler(smplRate, stats.scope("sampler")), stats.scope("filter")) andThen
+    new SpanSamplerFilter(new Sampler(sampleRate, stats.scope("sampler")), stats.scope("filter")) andThen
     new FlowReportingFilter(curReqRate.update(_), stats.scope("flowReporter"))
   }
 
@@ -153,7 +231,8 @@ class FlowReportingFilter(
   stats: StatsReceiver = DefaultStatsReceiver.scope("flowReporter"),
   freq: Duration = 30.seconds,
   timer: Timer = DefaultTimer.twitter
-) extends SpanStore.Filter with Closable {
+) extends Filter[Seq[Span], Unit, Seq[Span], Unit] with Closable {
+
   private[this] val spanCount = new AtomicInteger
   private[this] val countGauge = stats.addGauge("spanCount") { spanCount.get }
 
@@ -343,7 +422,7 @@ object DiscountedAverage extends (Seq[Int] => Double) {
 
 class CalculateSampleRate(
   targetStoreRate: Var[Int],
-  smplRate: Var[Double],
+  sampleRate: Var[Double],
   calculate: Seq[Int] => Double = DiscountedAverage,
   threshold: Double = 0.05,
   maxSampleRate: Double = 1.0,
@@ -353,14 +432,14 @@ class CalculateSampleRate(
   private[this] val tgtStoreRate = new AtomicInteger(0)
   targetStoreRate.changes.register(Witness(tgtStoreRate.set(_)))
 
-  private[this] val curSmplRate = new AtomicReference[Double](1.0)
-  smplRate.changes.register(Witness(curSmplRate))
+  private[this] val cursampleRate = new AtomicReference[Double](1.0)
+  sampleRate.changes.register(Witness(cursampleRate))
 
   private[this] val currentStoreRate = new AtomicInteger(0)
 
   private[this] val currentStoreRateGauge = stats.addGauge("currentStoreRate") { currentStoreRate.get }
   private[this] val tgtRateGauge = stats.addGauge("targetStoreRate") { tgtStoreRate.get }
-  private[this] val curSampleRateGauge = stats.addGauge("currentSampleRate") { curSmplRate.get.toFloat }
+  private[this] val curSampleRateGauge = stats.addGauge("currentSampleRate") { cursampleRate.get.toFloat }
 
   /**
    * Since we assume that the sample rate and storage request rate are
@@ -377,7 +456,7 @@ class CalculateSampleRate(
       currentStoreRate.set(curStoreRate.toInt)
       log.debug("Calculated current store rate: " + curStoreRate)
       if (curStoreRate <= 0) None else {
-        val curSampleRateSnap = curSmplRate.get
+        val curSampleRateSnap = cursampleRate.get
         val newSampleRate = curSampleRateSnap * tgtStoreRate.get / curStoreRate
         val sr = math.min(maxSampleRate, newSampleRate)
         val change = math.abs(curSampleRateSnap - sr)/curSampleRateSnap

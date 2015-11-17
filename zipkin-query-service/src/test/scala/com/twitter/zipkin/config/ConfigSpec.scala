@@ -15,30 +15,29 @@
  */
 package com.twitter.zipkin.config
 
-import com.twitter.io.TempFile
-import com.twitter.ostrich.admin.RuntimeEnvironment
+import com.google.common.base.Charsets.UTF_8
+import com.google.common.io.Resources
 import com.twitter.util.Eval
-import com.twitter.zipkin.builder.Builder
-import com.twitter.zipkin.query.ZipkinQuery
-import org.specs.Specification
+import com.twitter.zipkin.builder.QueryServiceBuilder
+import org.scalatest.{FunSuite, Matchers}
 
-class ConfigSpec extends Specification {
-  "/config" should {
-    val eval = new Eval
+class ConfigSpec extends FunSuite with Matchers {
 
-    "validate query configs" in {
-      val queryConfigFiles = Seq(
-        "/query-dev.scala",
-        "/query-cassandra.scala"
-      ) map { TempFile.fromResourcePath(_) }
+  val eval = new Eval
 
-      for (file <- queryConfigFiles) {
-        file.getName() in {
-          val config = eval[Builder[RuntimeEnvironment => ZipkinQuery]](file)
-          config must notBeNull
-          config.apply()
-        }
-      }
+  test("validate query configs") {
+    val configSource = Seq(
+      "/query-dev.scala",
+      "/query-mysql.scala",
+      "/query-cassandra.scala",
+      "/query-redis.scala"
+    ) map { r =>
+      Resources.toString(getClass.getResource(r), UTF_8)
+    }
+
+    for (source <- configSource) {
+      val query = eval[QueryServiceBuilder](source)
+      query should not be(Nil)
     }
   }
 }

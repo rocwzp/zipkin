@@ -16,15 +16,15 @@
 
 package com.twitter.zipkin.storage.redis
 
-import com.twitter.conversions.time.intToTimeableNumber
-import com.twitter.zipkin.common.{Annotation, AnnotationType, BinaryAnnotation, Endpoint, Span}
-import com.twitter.zipkin.conversions.thrift.thriftAnnotationTypeToAnnotationType
-import com.twitter.zipkin.thriftscala
-import com.twitter.zipkin.storage.IndexedTraceId
 import java.nio.ByteBuffer
 
+import com.twitter.conversions.time.intToTimeableNumber
+import com.twitter.util.Await.{ready, result}
+import com.twitter.zipkin.common.{Annotation, AnnotationType, BinaryAnnotation, Endpoint, Span}
+import com.twitter.zipkin.storage.IndexedTraceId
+
 class RedisIndexSpec extends RedisSpecification {
-  var redisIndex: RedisIndex = null
+  val redisIndex = new RedisIndex(_client, Some(7.days))
 
   val ep = Endpoint(123, 123, "service")
 
@@ -42,84 +42,64 @@ class RedisIndexSpec extends RedisSpecification {
   val ann3 = Annotation(2, "custom", Some(ep))
   val ann4 = Annotation(2, "custom", Some(ep))
 
-  val span1 = Span(123, "methodcall", spanId, None, List(ann1, ann3),
+  val span1 = Span(123, "methodcall", spanId, None, Some(1), Some(1), List(ann1, ann3),
     List(binaryAnnotation("BAH", "BEH")))
-  val span2 = Span(123, "methodcall", spanId, None, List(ann2),
+  val span2 = Span(123, "methodcall", spanId, None, Some(1), None, List(ann2),
     List(binaryAnnotation("BAH2", "BEH2")))
-  val span3 = Span(123, "methodcall", spanId, None, List(ann2, ann3, ann4),
+  val span3 = Span(123, "methodcall", spanId, None, Some(1), None, List(ann2, ann3, ann4),
     List(binaryAnnotation("BAH2", "BEH2")))
 
-  val spanEmptySpanName = Span(123, "", spanId, None, List(ann1, ann2), List())
-  val spanEmptyServiceName = Span(123, "spanname", spanId, None, List(), List())
+  val spanEmptySpanName = Span(123, "", spanId, None, Some(1), Some(1), List(ann1, ann2))
+  val spanEmptyServiceName = Span(123, "spanname", spanId)
 
-  val mergedSpan = Span(123, "methodcall", spanId, None,
+  val mergedSpan = Span(123, "methodcall", spanId, None, Some(1), Some(1),
     List(ann1, ann2), List(binaryAnnotation("BAH2", "BEH2")))
 
-  "RedisIndex" should {
-    doBefore {
-      _client.flushDB()
-      redisIndex = new RedisIndex {
-        val database = _client
-        val ttl = Some(7.days)
-      }
-    }
+  test("index and get span names") {
+    ready(redisIndex.index(span1))
+    result(redisIndex.getSpanNames("service")) should be (Set(span1.name))
+  }
 
-    doAfter {
-      redisIndex.close()
-    }
+  test("index and get service names") {
+    ready(redisIndex.index(span1))
+    result(redisIndex.getServiceNames) should be (Set(span1.serviceNames.head))
+  }
 
-    "index and get span names" in {
-      redisIndex.indexSpanNameByService(span1)()
-      redisIndex.getSpanNames("service")() mustEqual Set(span1.name)
-    }
+  test("getTraceIdsByName") {
+    ready(redisIndex.index(span1))
 
-    "index and get service names" in {
-      redisIndex.indexServiceName(span1)()
-      redisIndex.getServiceNames() mustEqual Set(span1.serviceNames.head)
-    }
+    val endTs = ann3.timestamp + 1
+    result(redisIndex.getTraceIdsByName("service", None, endTs, endTs, 1)).map(_.traceId) should
+      be(Seq(span1.traceId))
+    result(redisIndex.getTraceIdsByName("service", Some("methodcall"), endTs, endTs, 1)).map(_.traceId) should
+      be(Seq(span1.traceId))
+  }
 
-    "index only on annotation in each span with the same value" in {
-      redisIndex.indexSpanByAnnotations(span3)
-    }
+  test("getTraceIdsByAnnotation") {
+    ready(redisIndex.index(span1))
 
-    "getTraceIdsByName" in {
-      var ls = List[Long]()
-      redisIndex.indexTraceIdByServiceAndName(span1)()
-      redisIndex.getTraceIdsByName("service", None, 0, 3)() foreach {
-        _ mustEqual span1.traceId
-      }
-      redisIndex.getTraceIdsByName("service", Some("methodname"), 0, 3)() foreach {
-        _ mustEqual span1.traceId
-      }
-    }
+    // fetch by time based annotation, find trace
+    val endTs = ann3.timestamp + 1
+    result(redisIndex.getTraceIdsByAnnotation("service", "custom", None, endTs, endTs, 1)).map(_.traceId) should
+      be (Seq(span1.traceId))
 
-    "getTraceIdsByAnnotation" in {
-      redisIndex.indexSpanByAnnotations(span1)()
+    // should not find any traces since the core annotation doesn't exist in index
+    result(redisIndex.getTraceIdsByAnnotation("service", "cs", None, 0, endTs, 1)) should be (empty)
 
-      // fetch by time based annotation, find trace
-      var seq = redisIndex.getTraceIdsByAnnotation("service", "custom", None, 3, 3)()
-      (seq map (_.traceId)) mustEqual Seq(span1.traceId)
+    // should find traces by the key and value annotation
+    result(redisIndex.getTraceIdsByAnnotation("service", "BAH", Some(ByteBuffer.wrap("BEH".getBytes)), endTs, endTs, 1)) should
+      be (Seq(IndexedTraceId(span1.traceId, span1.timestamp.get)))
+  }
 
-      // should not find any traces since the core annotation doesn't exist in index
-      seq = redisIndex.getTraceIdsByAnnotation("service", "cs", None, 0, 3)()
-      //seq.isEmpty mustBe true
+  test("not index empty service name") {
+    ready(redisIndex.index(spanEmptyServiceName))
 
-      // should find traces by the key and value annotation
-      seq = redisIndex.getTraceIdsByAnnotation("service", "BAH",
-        Some(ByteBuffer.wrap("BEH".getBytes)), 4, 3)()
-      seq mustEqual Seq(IndexedTraceId(span1.traceId, span1.lastAnnotation.get.timestamp))
-    }
+    result(redisIndex.getServiceNames) should be (empty)
+  }
 
-    "not index empty service name" in {
-      redisIndex.indexServiceName(spanEmptyServiceName)
-      val serviceNames = redisIndex.getServiceNames()
-      serviceNames.isEmpty mustBe true
-    }
+  test("not index empty span name ") {
+    ready(redisIndex.index(spanEmptySpanName))
 
-    "not index empty span name " in {
-      redisIndex.indexSpanNameByService(spanEmptySpanName)
-      val spanNames = redisIndex.getSpanNames(spanEmptySpanName.name)
-      spanNames().isEmpty mustBe true
-    }
+    result(redisIndex.getSpanNames(spanEmptySpanName.name)) should be (empty)
   }
 }

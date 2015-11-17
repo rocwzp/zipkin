@@ -18,95 +18,74 @@ package com.twitter.zipkin.web
 
 import com.twitter.finagle.http.Request
 import com.twitter.util.Time
-import com.twitter.zipkin.common.{AnnotationType, BinaryAnnotation}
-import java.nio.ByteBuffer
-import java.text.SimpleDateFormat
-import org.junit.runner.RunWith
 import org.scalatest.FunSuite
-import org.scalatest.junit.JUnitRunner
 
-@RunWith(classOf[JUnitRunner])
 class QueryExtractorTest extends FunSuite {
 
-  def request(p: (String, String)*) = Request(p:_*)
+  val queryExtractor = new QueryExtractor(10)
 
-  test("require serviceName") {
-    assert(!QueryExtractor(request()).isDefined)
-  }
+  def request(p: (String, String)*) = Request(p: _*)
 
-  test("parse params") {
-    val endTs = Time.now
-    val endTimestamp = endTs.inMicroseconds.toString
+  test("getTimestampStr") {
+    val endTs = Time.now.inMillis.toString
     val r = request(
       "serviceName" -> "myService",
       "spanName" -> "mySpan",
-      "timestamp" -> endTimestamp,
+      "endTs" -> endTs,
       "limit" -> "1000")
 
-    val actual = QueryExtractor(r).get
-
-    assert(actual.serviceName === "myService")
-    assert(actual.spanName.get === "mySpan")
-    assert(actual.endTs ===  endTs.inMicroseconds)
-    assert(actual.limit === 1000)
+    val actual = queryExtractor.getTimestampStr(r)
+    assert(actual === endTs.toString)
   }
 
-  test("default endDateTime") {
+  test("default getTimestampStr") {
     Time.withCurrentTimeFrozen { tc =>
-      val actual = QueryExtractor(request("serviceName" -> "myService")).get
-      assert(actual.endTs === Time.now.sinceEpoch.inMicroseconds)
+      val actual = queryExtractor.getTimestampStr(request("serviceName" -> "myService"))
+      assert(actual === Time.now.sinceEpoch.inMillis.toString)
     }
   }
 
+  test("parse limit") {
+    val r = request("serviceName" -> "myService", "limit" -> "199")
+    val actual = queryExtractor.getLimitStr(r)
+    assert(actual === 199.toString)
+  }
+
   test("default limit") {
-    val actual = QueryExtractor(request("serviceName" -> "myService")).get
-    assert(actual.limit === Constants.DefaultQueryLimit)
-  }
-
-  test("parse spanName 'all'") {
-    val r = request("serviceName" -> "myService", "spanName" -> "all")
-    val actual = QueryExtractor(r).get
-    assert(!actual.spanName.isDefined)
-  }
-
-  test("parse spanName ''") {
-    val r = request("serviceName" -> "myService", "spanName" -> "")
-    val actual = QueryExtractor(r).get
-    assert(!actual.spanName.isDefined)
-  }
-
-  test("parse spanName") {
-    val r = request("serviceName" -> "myService", "spanName" -> "something")
-    val actual = QueryExtractor(r).get
-    assert(actual.spanName.get === "something")
+    val actual = new QueryExtractor(100).getLimitStr(request("serviceName" -> "myService"))
+    assert(actual === 100.toString)
   }
 
   test("parse annotations") {
     val r = request(
       "serviceName" -> "myService",
       "annotationQuery" -> "finagle.retry and finagle.timeout")
-    val actual = QueryExtractor(r).get
-    assert(actual.annotations.get.contains("finagle.retry"))
-    assert(actual.annotations.get.contains("finagle.timeout"))
+    val actual = queryExtractor.getAnnotations(r).get
+    assert(actual._1.contains("finagle.retry"))
+    assert(actual._1.contains("finagle.timeout"))
   }
 
   test("parse key value annotations") {
     val r = request(
       "serviceName" -> "myService",
       "annotationQuery" -> "http.responsecode=500")
-    val actual = QueryExtractor(r).get
-    assert(
-      actual.binaryAnnotations.get ===
-        Seq(BinaryAnnotation("http.responsecode", ByteBuffer.wrap("500".getBytes), AnnotationType.String, None)))
+    val actual = queryExtractor.getAnnotations(r).get
+    assert(actual._2 === Map("http.responsecode" -> "500"))
   }
 
   test("parse key value annotations with slash") {
     val r = request(
       "serviceName" -> "myService",
       "annotationQuery" -> "http.uri=/sessions")
-    val actual = QueryExtractor(r).get
-    assert(
-      actual.binaryAnnotations.get ===
-        Seq(BinaryAnnotation("http.uri", ByteBuffer.wrap("/sessions".getBytes), AnnotationType.String, None)))
+    val actual = queryExtractor.getAnnotations(r).get
+    assert(actual._2 === Map("http.uri" -> "/sessions"))
+  }
+
+  test("parse key value annotations with equal sign") {
+    val r = request(
+      "serviceName" -> "myService",
+      "annotationQuery" -> "http.uri=sessions=foo")
+    val actual = queryExtractor.getAnnotations(r).get
+    assert(actual._2 === Map("http.uri" -> "sessions=foo"))
   }
 }
